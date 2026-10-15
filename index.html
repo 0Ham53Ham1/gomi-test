@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ごみ分別テスト</title>
+<link rel="manifest" href="manifest.webmanifest">
+<meta name="theme-color" content="#2e7d32">
+<link rel="apple-touch-icon" href="icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="ごみ分別">
+<style>
+  :root { --bg:#f6f7f4; --card:#fff; --text:#1f2a1f; --muted:#667066; --accent:#2e7d32; --line:#dde3dc; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, "Hiragino Sans", "Yu Gothic UI", sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:560px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.3rem; margin:8px 0 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:12px; }
+  label { display:block; font-size:.85rem; color:var(--muted); margin:10px 0 4px; }
+  input[type=text], input[type=password], textarea { width:100%; padding:10px; border:1px solid var(--line); border-radius:8px; font-size:1rem; font-family:inherit; }
+  textarea { min-height:140px; font-size:.9rem; }
+  input[type=range] { width:100%; }
+  button { width:100%; padding:14px; border:0; border-radius:10px; background:var(--accent); color:#fff; font-size:1rem; font-weight:600; cursor:pointer; margin-top:12px; }
+  button:disabled { opacity:.5; cursor:default; }
+  canvas { width:100%; border-radius:8px; display:none; margin-top:12px; background:#eee; }
+  .det { display:flex; align-items:center; gap:10px; padding:10px 0; border-top:1px solid var(--line); }
+  .det:first-child { border-top:0; }
+  .swatch { width:14px; height:14px; border-radius:3px; flex:none; }
+  .det .name { font-weight:600; }
+  .det .cat { margin-left:auto; font-weight:700; color:var(--accent); text-align:right; }
+  .muted { color:var(--muted); font-size:.85rem; }
+  .err { color:#b3261e; white-space:pre-wrap; }
+  details summary { cursor:pointer; font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>🗑️ ごみ分別テスト（Roboflow）</h1>
+
+  <div class="card">
+    <details id="settings">
+      <summary>モデル設定</summary>
+      <label for="apiKey">Roboflow APIキー（このブラウザにだけ保存されます）</label>
+      <input id="apiKey" type="password" placeholder="Roboflow の API Key">
+      <label for="modelId">モデルID（プロジェクト名/バージョン）</label>
+      <input id="modelId" type="text" placeholder="例：garbage-detection-abcde/1">
+      <p class="muted">Roboflow のワークスペース「project-whjue」→ 対象プロジェクト → Deploy 画面に表示される Model ID を入れてください。</p>
+      <label for="endpoint">APIのURL</label>
+      <input id="endpoint" type="text" value="https://serverless.roboflow.com">
+      <label for="conf">信頼度のしきい値：<span id="confVal">40</span>%</label>
+      <input id="conf" type="range" min="5" max="95" step="5" value="40">
+      <label for="rules">クラス名 → 分別区分（1行に「クラス名=分別区分」）</label>
+      <textarea id="rules"></textarea>
+    </details>
+  </div>
+
+  <div class="card">
+    <label for="photo">ごみの写真を撮る／選ぶ</label>
+    <input id="photo" type="file" accept="image/*" capture="environment">
+    <canvas id="canvas"></canvas>
+    <button id="run" disabled>分別を調べる</button>
+  </div>
+
+  <div id="out"></div>
+  <p class="muted">※ 物体検出モデルによる判定です。正確な分別は自治体の公式情報で確認してください。</p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} }
+};
+
+// モデルのクラス名に合わせて書き換える（設定画面から編集でき、ブラウザに保存される）
+const DEFAULT_RULES = `pet_bottle=びん・ペットボトル
+plastic_bottle=びん・ペットボトル
+bottle=びん・ペットボトル
+can=びん・ペットボトル（缶）
+glass=びん・ペットボトル
+plastic=プラスチック
+plastic_bag=燃えるごみ
+paper=燃えるごみ（紙は資源物へ）
+cardboard=資源物（段ボール）
+metal=燃えないごみ
+battery=有害ごみ（回収ボックス）
+food=燃えるごみ
+trash=燃えるごみ`;
+
+for (const k of ['apiKey', 'modelId', 'endpoint', 'conf', 'rules']) {
+  const v = store.get('rf_' + k);
+  if (v !== null) $(k).value = v;
+  $(k).addEventListener('change', () => store.set('rf_' + k, $(k).value.trim()));
+}
+if (!$('rules').value.trim()) $('rules').value = DEFAULT_RULES;
+$('confVal').textContent = $('conf').value;
+$('conf').addEventListener('input', () => $('confVal').textContent = $('conf').value);
+if (!$('apiKey').value || !$('modelId').value) $('settings').open = true;
+
+const COLORS = ['#e53935', '#1e88e5', '#43a047', '#fb8c00', '#8e24aa', '#00897b', '#d81b60', '#6d4c41'];
+let photo = null; // 縮小後の画像 { img, base64 }
+
+$('photo').addEventListener('change', async e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  photo = await shrink(file, 1024);
+  draw([]);
+  $('canvas').style.display = 'block';
+  $('run').disabled = false;
+  show('');
+});
+
+// 送信サイズを抑えるため長辺 maxSize px の JPEG に縮小（検出座標もこのサイズ基準になる）
+function shrink(file, maxSize) {
+  return new Promise((resolve, reject) => {
+    const src = new Image();
+    src.onload = () => {
+      const scale = Math.min(1, maxSize / Math.max(src.width, src.height));
+      const c = document.createElement('canvas');
+      c.width = Math.round(src.width * scale);
+      c.height = Math.round(src.height * scale);
+      c.getContext('2d').drawImage(src, 0, 0, c.width, c.height);
+      URL.revokeObjectURL(src.src);
+      const dataUrl = c.toDataURL('image/jpeg', 0.85);
+      const img = new Image();
+      img.onload = () => resolve({ img, base64: dataUrl.split(',')[1] });
+      img.src = dataUrl;
+    };
+    src.onerror = reject;
+    src.src = URL.createObjectURL(file);
+  });
+}
+
+$('run').addEventListener('click', async () => {
+  const key = $('apiKey').value.trim();
+  const modelId = $('modelId').value.trim().replace(/^\/+|\/+$/g, '');
+  const endpoint = ($('endpoint').value.trim() || 'https://serverless.roboflow.com').replace(/\/+$/, '');
+  if (!key || !/^[^/]+\/\d+$/.test(modelId)) {
+    $('settings').open = true;
+    return show(`<div class="card"><p class="err">APIキーと、「プロジェクト名/バージョン番号」の形のモデルIDを入力してください。</p></div>`);
+  }
+
+  $('run').disabled = true;
+  show('<div class="card muted">判定中…</div>');
+  try {
+    const url = `${endpoint}/${modelId}?api_key=${encodeURIComponent(key)}&confidence=${$('conf').value}`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: photo.base64
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.message || data.error || `${res.status} ${res.statusText}`);
+    const preds = (data.predictions || []).sort((a, b) => b.confidence - a.confidence);
+    draw(preds);
+    render(preds);
+  } catch (err) {
+    show(`<div class="card"><p class="err">エラー：${esc(err.message)}</p></div>`);
+  } finally {
+    $('run').disabled = false;
+  }
+});
+
+function parseRules() {
+  const map = {};
+  for (const line of $('rules').value.split('\n')) {
+    const i = line.indexOf('=');
+    if (i > 0) map[norm(line.slice(0, i))] = line.slice(i + 1).trim();
+  }
+  return map;
+}
+// 大文字小文字・空白・ハイフンの違いを吸収して照合する
+function norm(s) { return s.trim().toLowerCase().replace(/[\s-]+/g, '_'); }
+
+function colorOf(cls, classes) { return COLORS[classes.indexOf(cls) % COLORS.length]; }
+
+function draw(preds) {
+  const c = $('canvas'), ctx = c.getContext('2d'), img = photo.img;
+  c.width = img.width; c.height = img.height;
+  ctx.drawImage(img, 0, 0);
+  const classes = [...new Set(preds.map(p => p.class))];
+  const lw = Math.max(2, img.width / 250);
+  ctx.font = `bold ${Math.max(14, img.width / 40)}px sans-serif`;
+  for (const p of preds) {
+    const color = colorOf(p.class, classes);
+    const x = p.x - p.width / 2, y = p.y - p.height / 2;
+    ctx.strokeStyle = color; ctx.lineWidth = lw;
+    ctx.strokeRect(x, y, p.width, p.height);
+    const label = `${p.class} ${Math.round(p.confidence * 100)}%`;
+    const tw = ctx.measureText(label).width + 8, th = parseInt(ctx.font.match(/\d+/)[0]) + 6;
+    const ly = y - th < 0 ? y : y - th;
+    ctx.fillStyle = color; ctx.fillRect(x, ly, tw, th);
+    ctx.fillStyle = '#fff'; ctx.fillText(label, x + 4, ly + th - 6);
+  }
+}
+
+function render(preds) {
+  if (!preds.length) {
+    return show(`<div class="card"><p>何も検出されませんでした。</p><p class="muted">しきい値を下げるか、物を大きく写して撮り直してください。</p></div>`);
+  }
+  const rules = parseRules();
+  const classes = [...new Set(preds.map(p => p.class))];
+  show(`<div class="card">${preds.map(p => {
+    const cat = rules[norm(p.class)];
+    return `<div class="det">
+      <span class="swatch" style="background:${colorOf(p.class, classes)}"></span>
+      <div><div class="name">${esc(p.class)}</div><div class="muted">信頼度 ${Math.round(p.confidence * 100)}%</div></div>
+      <div class="cat">${cat ? esc(cat) : '<span class="muted">分別ルール未登録</span>'}</div>
+    </div>`;
+  }).join('')}</div>`);
+}
+
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+
+function show(html) { $('out').innerHTML = html; }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c])); }
+</script>
+</body>
+</html>
